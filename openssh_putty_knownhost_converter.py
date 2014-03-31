@@ -19,6 +19,9 @@ import argparse
 import os, os.path
 import collections
 import re
+import winreg
+import socket
+import math
 
 # represents the data that would go inside the registry key for the putty known hosts
 # example:
@@ -46,6 +49,109 @@ def puttyToOpenSSH(args):
     ''' converts putty known hosts entries to openSSH ones
     @param args - the argument parser Namespace object we got from parse_args()
     '''
+
+
+    # open the registry key that has the Known hosts
+    puttyKey = None
+    try:
+        puttyKey = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Software\\SimonTatham\\PuTTY\\SshHostKeys")
+    except OSError:
+        raise Exception("could not open the registry key containing the putty known host entries, are there any in there?")
+
+    # iterate over them, creating PuttyKnownhostEntry objects
+    puttyEntries = []
+    counter = 0
+    while True:
+
+        key = None
+        value = None
+        dataType = None
+        try:
+            key, value, dataType = winreg.EnumValue(puttyKey, counter)
+        except OSError:
+            # no more data
+            break
+
+
+        exp = value.split(",")[0]
+        modulus = value.split(",")[1]
+        puttyEntries.append(PuttyKnownhostEntry(key, exp, modulus))
+
+        counter += 1
+
+
+    # now go through each entry and convert it to a openssh line
+    openSshLines = []
+    for iterEntry in puttyEntries:
+
+        # parse the key name, which has the hostname or ip, port, and algorithm
+        # it looks like: 'rsa2@60101:mgrandi.no-ip.org'
+        alg = iterEntry.keyName.split("@")[0]
+        opensshAlg = ""
+        if alg == "rsa2":
+            opensshAlg = "ssh-rsa"
+        elif alg == "dsa":
+            opensshAlg = "ssh-dss"
+
+        secondPart = iterEntry.keyName.split("@")[1]
+        port = secondPart.split(":")[0] # putty always stores the port
+
+        hostOrIp = secondPart.split(":")[1]
+        hostName = hostOrIp
+
+        # if the user wants to resolve ip addresses, do it
+        # TODO: if we want ipv6 support we should somehow have an option to choose the 
+        # ipv6 address if present from the result we get from getaddrinfo()
+        if args.should_resolve:
+            addrList = socket.getaddrinfo(hostOrIp, port)
+
+            hostName = addrList[0][4][0]
+
+        # now calculate the data that it stores
+        resultBytes = io.BytesIO()
+
+        resultBytes.write(struct.pack(">i", 7)) # write that there is a 7 byte algorithm identifier
+
+        resultBytes.write(opensshAlg.encode("utf-8")) # write algorithm identifier
+
+        expInt = int(iterEntry.exponent[2:], 16)
+
+        # how many bytes does it take to store this exponent?
+        numBytes = math.ceil(int(expInt).bit_length() / 8)
+
+        # write length of exponent
+        resultBytes.write(struct.pack(">i", numBytes))
+
+        # write exponent
+        resultBytes.write(struct.pack(">{}s".format(numBytes), int(expInt).to_bytes(numBytes, "big")))
+
+
+        modulusData = binascii.unhexlify(iterEntry.modulus[2:])
+
+        # here we have to 'add' a b'\x00' byte to the start of this, because i guess we are padding the modulus
+        # to match the RSA key modulus, see my comment later on in this file)
+        modulusData = b'\x00' + modulusData
+
+        # write length of modulus
+        resultBytes.write(struct.pack(">i", len(modulusData)))
+
+        # write modulus
+        resultBytes.write(modulusData)
+
+
+        # base64 it
+        result = base64.b64encode(resultBytes.getvalue())
+
+        # now we have the openssh line
+        # put it in our list
+        # (like [68.98.45.184]:23 ssh-rsa AAAAB3.....)
+        openSshLines.append("[{}]:{} {} {}".format(hostName, port, opensshAlg, result.decode("utf-8")))
+
+
+    import pprint
+    pprint.pprint(openSshLines)
+
+
 
 
 def openSSHToPutty(args):
@@ -98,13 +204,6 @@ def openSSHToPutty(args):
         $                                       # end of line
         ''', re.VERBOSE | re.MULTILINE | re.UNICODE)
 
-
-    # host = "bazaar.launchpad.net"
-    # port = "22"
-
-    # #b64str = "AAAAB3NzaC1yc2EAAAABIwAAAIEApuXd4MHTfr1qLXWeClxTTQYZQblCA+nHvbjAjowkEd2Y4kpvntJOVewoSwa22zTbiYSmmssCuCkFHwcpnZBZN5qMWewjizav30WfeyLR5Kng5qucxmFAEkNJjCJiu194wRNKu0cD99Uk/6X/AfsWGLgmL5pa5UFk62aW+iZLUQ8="
-    # b64str = "AAAAB3NzaC1yc2EAAAABIwAAAQEAq2A7hRGmdnm9tUDbO9IDSwBK6TbQa+PXYPCPy6rbTrTtw7PHkccKrpp0yVhp5HdEIcKr6pLlVDBfOLX9QUsyCOV0wzfjIJNlGEYsdlLJizHhbn2mUjvSAHQqZETYP81eFzLQNnPHt4EVVUh7VfDESU84KezmD5QlWpXLmvU31/yMf+Se8xhHTvKSCZIFImWwoG6mbUoWf9nzpIoaSjB+weqqUUmpaaasXVal72J+UX2B+2RPW3RcT0eOzQgqlJL3RKrTJvdsjE3JEAvGq3lGHSZXy28G3skua2SmVi/w4yCE6gbODqnTWlg7+wC604ydGXA8VJiS5ap43JXiUFFAaQ=="
-    
     # make sure file exists
     if not os.path.isfile(knownHostsPath):
         raise Exception("Unable to find known_hosts file, {} was not found!".format(knownHostsPath))
@@ -117,7 +216,7 @@ def openSSHToPutty(args):
     for iterMatch in knownHostRegex.finditer(knownHostFileData):
 
         iterMatchResult = opensshMatchToPuttyKnownhost(iterMatch)
-        print(iterMatchResult)
+        print("Key: {}\nValue: {},{}".format(iterMatchResult.keyName, iterMatchResult.exponent, iterMatchResult.modulus))
     
 
 def opensshMatchToPuttyKnownhost(matchObj):
@@ -215,9 +314,9 @@ def opensshMatchToPuttyKnownhost(matchObj):
 
     if modulus[0:1] == b'\x00':
         # remove leading 0
-        return PuttyKnownhostEntry(keyName, hex(exponent), binascii.hexlify(modulus[1:]).decode("utf-8"))
+        return PuttyKnownhostEntry(keyName, hex(exponent), "0x" + binascii.hexlify(modulus[1:]).decode("utf-8"))
     else:
-        return PuttyKnownhostEntry(keyName, hex(exponent), binascii.hexlify(modulus).decode("utf-8"))
+        return PuttyKnownhostEntry(keyName, hex(exponent), "0x" + binascii.hexlify(modulus).decode("utf-8"))
  
     
 
@@ -232,5 +331,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--openssh-knownhosts-file", help="Specify a manual path to the openSSH " +
         "known_hosts file, in case we can't find it automatically")
+    parser.add_argument("--should-resolve", action="store_true",
+        help="Whether or not to resolve ip addresses and store that rather then the 'text' hostname")
 
     main(parser.parse_args())
