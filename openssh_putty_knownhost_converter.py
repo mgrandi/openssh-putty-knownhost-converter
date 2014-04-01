@@ -35,8 +35,6 @@ def main(args):
     ''' figures out what function to call
     @param args - the argument parser Namespace object we got from parse_args()
     '''
-    print(args)
-
     if args.convert_to_openssh:
         puttyToOpenSSH(args)
 
@@ -103,9 +101,13 @@ def puttyToOpenSSH(args):
         # TODO: if we want ipv6 support we should somehow have an option to choose the 
         # ipv6 address if present from the result we get from getaddrinfo()
         if args.should_resolve:
-            addrList = socket.getaddrinfo(hostOrIp, port)
-
-            hostName = addrList[0][4][0]
+            try:
+                addrList = socket.getaddrinfo(hostOrIp, port)
+                hostName = addrList[0][4][0]
+            except OSError as e:
+                print("#WARNING: error when trying to resolve '{}:{}', error: '{}'\n\n".format(hostOrIp, port, e))
+                hostName = hostOrIp
+            
 
         # now calculate the data that it stores
         resultBytes = io.BytesIO()
@@ -148,8 +150,8 @@ def puttyToOpenSSH(args):
         openSshLines.append("[{}]:{} {} {}".format(hostName, port, opensshAlg, result.decode("utf-8")))
 
 
-    import pprint
-    pprint.pprint(openSshLines)
+    for iterEntry in openSshLines:
+        args.output.write(iterEntry + "\n")
 
 
 
@@ -212,12 +214,21 @@ def openSSHToPutty(args):
     with open(knownHostsPath, "r", encoding="utf-8") as f:
         knownHostFileData = f.read()
 
+
+    puttyResults = []
     # go through every entry
     for iterMatch in knownHostRegex.finditer(knownHostFileData):
 
-        iterMatchResult = opensshMatchToPuttyKnownhost(iterMatch)
-        print("Key: {}\nValue: {},{}".format(iterMatchResult.keyName, iterMatchResult.exponent, iterMatchResult.modulus))
+        puttyResults.append(opensshMatchToPuttyKnownhost(iterMatch))
+        #print("Key: {}\nValue: {},{}".format(iterMatchResult.keyName, iterMatchResult.exponent, iterMatchResult.modulus))
     
+
+    # now write to output
+    args.output.write("Windows Registry Editor Version 5.00\n\n")
+    args.output.write("[HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\SshHostKeys]\n")
+
+    for iterEntry in puttyResults:
+        args.output.write('''"{}"="{},{}"\n'''.format(iterEntry.keyName, iterEntry.exponent, iterEntry.modulus))
 
 def opensshMatchToPuttyKnownhost(matchObj):
     '''takes in a re.Match object and converts the data inside to 
@@ -266,16 +277,16 @@ def opensshMatchToPuttyKnownhost(matchObj):
 
     # read in the length of the exponent
     exponentLength = struct.unpack(">i", opensshBytes.read(4))[0]
-    print("\texponent length is {}".format(exponentLength))
+    #print("\texponent length is {}".format(exponentLength))
 
     # read in exponent
     exponent = int.from_bytes(opensshBytes.read(exponentLength), "big")
-    print("\texponent  is {}".format(exponent))
+    #print("\texponent  is {}".format(exponent))
 
 
     # read in length of modulus
     modLength = struct.unpack(">i", opensshBytes.read(4))[0]
-    print("\tmodulus length is {}".format(modLength))
+    #print("\tmodulus length is {}".format(modLength))
 
     # read in modulus
     modulus = opensshBytes.read(modLength)
@@ -333,5 +344,11 @@ if __name__ == "__main__":
         "known_hosts file, in case we can't find it automatically")
     parser.add_argument("--should-resolve", action="store_true",
         help="Whether or not to resolve ip addresses and store that rather then the 'text' hostname")
+    parser.add_argument("--output", nargs="?", type=argparse.FileType('w'), default=sys.stdout,
+        help="Where to save the output, either a .reg file if converting to putty or a known_hosts " +
+        " file if converting to openssh, default is stdout")
 
-    main(parser.parse_args())
+    try:
+        main(parser.parse_args())
+    except Exception as e:
+        print("Something went wrong: {}".format(e))
